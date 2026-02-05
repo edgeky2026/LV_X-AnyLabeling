@@ -22,3 +22,4 @@ json_repair
 importlib_metadata
 markdown
 requests
+imageio-ffmpeg>=0.4.9

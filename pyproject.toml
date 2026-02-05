@@ -86,6 +86,7 @@ dependencies = [
     "termcolor",
     "tokenizers",
     "requests",
+    "imageio-ffmpeg>=0.4.9",
 ]
 
 # Optional dependencies ------------------------------------------------------------------------------------------------

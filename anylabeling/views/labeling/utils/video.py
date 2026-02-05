@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import time
 import subprocess
+import imageio_ffmpeg
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
@@ -18,6 +19,8 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSpinBox,
+    QDoubleSpinBox,
+    QCheckBox,
     QApplication,
 )
 
@@ -47,22 +50,40 @@ class FrameExtractionDialog(QDialog):
         layout.setSpacing(8)
         layout.setContentsMargins(12, 8, 12, 12)
 
-        # Interval input
-        interval_layout = QHBoxLayout()
-        template = self.tr("Frame interval (fps: %.2f):")
-        interval_label = QLabel(template % self.fps)
-        self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(1, max(1, self.total_frames))
-        self.interval_spin.setValue(1)
-        self.interval_spin.setStyleSheet(
+        # Source FPS input
+        source_fps_layout = QHBoxLayout()
+        source_fps_label = QLabel(self.tr("Source FPS:"))
+        self.source_fps_spin = QDoubleSpinBox()
+        self.source_fps_spin.setRange(0.01, 1000.0)
+        self.source_fps_spin.setValue(self.fps)
+        self.source_fps_spin.setSingleStep(1.0)
+        self.source_fps_spin.setStyleSheet(
             ChatbotDialogStyle.get_spinbox_style(
                 up_arrow_url=new_icon_path("caret-up", "svg"),
                 down_arrow_url=new_icon_path("caret-down", "svg"),
             )
         )
-        self.interval_spin.setMinimumWidth(100)
-        interval_layout.addWidget(interval_label)
-        interval_layout.addWidget(self.interval_spin)
+        self.source_fps_spin.setMinimumWidth(100)
+        self.source_fps_spin.setEnabled(False)  # Make read-only as per request
+        source_fps_layout.addWidget(source_fps_label)
+        source_fps_layout.addWidget(self.source_fps_spin)
+
+        # Output FPS input (replaces Interval)
+        output_fps_layout = QHBoxLayout()
+        output_fps_label = QLabel(self.tr("Output FPS:"))
+        self.output_fps_spin = QDoubleSpinBox()
+        self.output_fps_spin.setRange(0.01, 1000.0)
+        self.output_fps_spin.setValue(8.0) # Default requested by user
+        self.output_fps_spin.setSingleStep(1.0)
+        self.output_fps_spin.setStyleSheet(
+            ChatbotDialogStyle.get_spinbox_style(
+                up_arrow_url=new_icon_path("caret-up", "svg"),
+                down_arrow_url=new_icon_path("caret-down", "svg"),
+            )
+        )
+        self.output_fps_spin.setMinimumWidth(100)
+        output_fps_layout.addWidget(output_fps_label)
+        output_fps_layout.addWidget(self.output_fps_spin)
 
         # Prefix input
         prefix_layout = QHBoxLayout()
@@ -102,9 +123,19 @@ class FrameExtractionDialog(QDialog):
         seq_layout.addWidget(seq_label)
         seq_layout.addWidget(self.seq_spin)
 
+        # PNG Toggle
+        self.use_png_check = QCheckBox(self.tr("Export as PNG (Lossless)"))
+        self.use_png_check.setChecked(False)
+        self.use_png_check.toggled.connect(self.update_example)
+
         layout.addLayout(prefix_layout)
         layout.addLayout(seq_layout)
-        layout.addLayout(interval_layout)
+        layout.addLayout(source_fps_layout)
+        layout.addLayout(output_fps_layout)
+        layout.addWidget(self.use_png_check)
+
+        # FFMPEG Toggle removed as per user request (relying on imageio_ffmpeg)
+
 
         # Example output
         self.example_label = QLabel()
@@ -133,15 +164,18 @@ class FrameExtractionDialog(QDialog):
         self.resize(480, 240)
 
     def update_example(self):
-        example = f"{self.prefix_edit.text()}{str(1).zfill(self.seq_spin.value())}.jpg"
+        ext = ".png" if self.use_png_check.isChecked() else ".jpg"
+        example = f"{self.prefix_edit.text()}{str(1).zfill(self.seq_spin.value())}{ext}"
         template = self.tr("Example output: {example}")
         self.example_label.setText(template.format(example=example))
 
     def get_values(self):
         return (
-            self.interval_spin.value(),
+            self.source_fps_spin.value(),
+            self.output_fps_spin.value(),
             self.prefix_edit.text(),
             self.seq_spin.value(),
+            self.use_png_check.isChecked(),
         )
 
 
@@ -222,16 +256,26 @@ def extract_frames_from_video(self, input_file, out_dir):
             # video_capture is released in the outer finally block
             return None
 
-        interval, prefix, seq_len = dialog.get_values()
+        source_fps, output_fps, prefix, seq_len, use_png = dialog.get_values()
         os.makedirs(out_dir, exist_ok=True)
 
-        # --- Check for ffmpeg ---
-        ffmpeg_path = shutil.which("ffmpeg")
+        ext = ".png" if use_png else ".jpg"
 
-        # Inner try: Handle the actual extraction (ffmpeg or OpenCV)
+        # --- Check for ffmpeg ---
+        try:
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as e:
+            logger.error(f"Failed to get ffmpeg executable from imageio-ffmpeg: {e}")
+            ffmpeg_path = None
+
+        # Logic:
+        # If ffmpeg found -> Run FFMPEG
+        # Else -> Run OpenCV (Fallback)
+
         try:
             if ffmpeg_path:
                 logger.info(f"Detected ffmpeg for extraction: {ffmpeg_path}")
+                logger.info(f"Using FFMPEG backend. Target Output FPS: {output_fps}")
                 # --- FFMPEG Path ---
                 # VideoCapture is no longer needed once ffmpeg takes over
                 if video_capture and video_capture.isOpened():
@@ -257,10 +301,10 @@ def extract_frames_from_video(self, input_file, out_dir):
                 video_source_path = (
                     temp_video_path if temp_video_path else input_file_str
                 )
-                output_pattern = osp.join(out_dir, f"{prefix}%0{seq_len}d.jpg")
-                output_fps = (
-                    fps / interval if interval > 0 else fps
-                )  # Avoid division by zero
+                output_pattern = osp.join(out_dir, f"{prefix}%0{seq_len}d{ext}")
+                # output_fps = (
+                #     fps / interval if interval > 0 else fps
+                # )  # Avoid division by zero
 
                 cmd = [
                     ffmpeg_path,
@@ -268,12 +312,18 @@ def extract_frames_from_video(self, input_file, out_dir):
                     video_source_path,
                     "-vf",
                     f"fps={output_fps}",
-                    "-qscale:v",
-                    "2",  # High quality JPEG
+                ]
+
+                if use_png:
+                    cmd.extend(["-c:v", "png"])
+                else:
+                    cmd.extend(["-qscale:v", "2"])  # High quality JPEG
+
+                cmd.extend([
                     "-start_number",
                     "0",
                     output_pattern,
-                ]
+                ])
                 logger.info(f"Running ffmpeg command: {' '.join(cmd)}")
 
                 ffmpeg_failed = False
@@ -347,7 +397,7 @@ def extract_frames_from_video(self, input_file, out_dir):
                                         name
                                         for name in os.listdir(out_dir)
                                         if name.startswith(prefix)
-                                        and name.endswith(".jpg")
+                                        and name.endswith(ext)
                                     ]
                                 )
                                 logger.info(
@@ -404,8 +454,17 @@ def extract_frames_from_video(self, input_file, out_dir):
                     return None  # Indicate failure if ffmpeg path failed
 
             else:  # if not ffmpeg_path
-                logger.info("ffmpeg not found. Using OpenCV for extraction.")
+                logger.info("ffmpeg not found (or failed). Using OpenCV for extraction.")
+
                 # --- OpenCV Path ---
+                # Calculate interval based on user-provided Source FPS and Output FPS
+                if output_fps > 0:
+                   interval = max(1, round(source_fps / output_fps))
+                else:
+                   interval = 1
+
+                logger.info(f"Using OpenCV backend. Calculated Interval: {interval} frames (Source FPS: {source_fps} / Target Output FPS: {output_fps})")
+
                 estimated_frames = (
                     (total_frames + interval - 1) // interval
                     if total_frames > 0 and interval > 0
@@ -452,7 +511,7 @@ def extract_frames_from_video(self, input_file, out_dir):
                     if frame_count % interval == 0:
                         frame_filename = osp.join(
                             out_dir,
-                            f"{prefix}{str(saved_frame_count).zfill(seq_len)}.jpg",
+                            f"{prefix}{str(saved_frame_count).zfill(seq_len)}{ext}",
                         )
                         try:
                             write_success = cv2.imwrite(frame_filename, frame)

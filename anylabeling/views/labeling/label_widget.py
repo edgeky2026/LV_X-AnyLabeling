@@ -2367,6 +2367,8 @@ class LabelingWidget(LabelDialog):
         self.actions.undo.setEnabled(self.canvas.is_shape_restorable)
 
         if self._config["auto_save"]:
+            if self.image_path is None:
+                return
             label_file = osp.splitext(self.image_path)[0] + ".json"
             if self.output_dir:
                 label_file_without_path = osp.basename(label_file)

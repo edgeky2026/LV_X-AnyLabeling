@@ -8,6 +8,67 @@
 
 </div>
 
+<!-- LOCAL CHANGES -->
+# X-AnyLabeling ローカル変更点ドキュメント
+
+本ドキュメントでは、本家の開発版（`origin/main`）と比較して、ローカルリポジトリで独自に行われている変更点について解説します。
+
+## 概要
+動画処理の最適化、バグ修正、および動画フレーム切り出しワークフローの改善が含まれています。
+
+## 詳細な変更点
+
+### 1. リモートサーバー連携の最適化
+**関連ファイル:**
+- `anylabeling/services/auto_labeling/remote_server.py`
+- `anylabeling/configs/auto_labeling/remote_server.yaml`
+
+**変更内容:**
+- **パフォーマンス向上:** 動画の初期化プロセスをBase64エンコーディングから `multipart/form-data` 形式に変更しました。これにより、動画フレームのアップロード速度が大幅に向上しています。
+- **設定変更:** 大きな動画ファイルに対応するため、デフォルトのタイムアウト時間を 180秒から **300秒** に延長しました。
+- **安定性:** 自動アノテーションの伝播処理（Propagation）において、結果（`results`）が `None` の場合でもエラーにならないよう安全策を追加しました。
+
+### 2. 動画エクスポートとバッチ処理
+**関連ファイル:** `anylabeling/views/labeling/utils/batch.py`
+
+**変更内容:**
+- **バックグラウンド出力:** バッチ処理完了後に、アノテーション結果（マスクや矩形）を焼き付けた動画（MP4）をバックグラウンドで生成する `VideoExportThread` を実装しました。
+- **独自のバッチモード:** 「動画トラッキング（伝播）」モードと「テキストプロンプト」モードを選択できる独自のダイアログ機能を維持しました。
+- **UX改善:**
+  - 動画モード選択時、冗長な「すべての画像を処理しますか？」という確認ダイアログをスキップするようにしました。
+  - 進捗ダイアログの挙動を調整し、動画トラッキング中のステータスが正しく表示されるようにしました。
+
+### 3. 動画フレーム切り出し機能の強化
+**関連ファイル:** `anylabeling/views/labeling/utils/video.py`
+
+**変更内容:**
+- **FFMPEG統合:** `imageio-ffmpeg` ライブラリを利用して、FFMPEGの検出と利用を確実に行えるようにしました。
+- **FPS制御:** 単純な「間隔（Interval）」設定を廃止し、**「ソースFPS（自動検出）」** と **「出力FPS（指定可能）」** の設定に変更しました。これにより、指定したFPS間隔で正確にフレームを抽出できます。
+- **ロスレス出力:** 画像をJPEGではなく **PNG（可逆圧縮）** で出力するオプション（チェックボックス）を追加しました。
+- **フォールバック機能:** FFMPEGが利用できない、またはエラーが発生した場合でも、自動的にOpenCVを使用した処理に切り替わり、計算された間隔でフレーム抽出を継続する堅牢な仕組みを実装しました。
+
+### 4. バグ修正と安定性の向上
+
+**`anylabeling/views/labeling/label_widget.py`**
+- **修正:** 画像がロードされていない状態で自動保存が走った際に `TypeError` が発生するのを防ぐため、`self.image_path` のNullチェックを追加しました。
+
+**`anylabeling/views/labeling/widgets/canvas.py`**
+- **修正:** 選択された図形を削除する際、リスト内に存在するかを確認するチェック（`if shape in self.shapes:`）を追加し、`ValueError` を防止しました。
+
+**`anylabeling/views/labeling/utils/file_search.py`**
+- **修正:** 正規表現の記述による `SyntaxWarning: invalid escape sequence` を解消するため、docstringをraw string (`r"""`) に変更しました。
+
+### 5. システム要件と起動処理
+
+**`anylabeling/views/mainwindow.py`**
+- **起動時処理:** アプリケーション起動時に `imageio-ffmpeg` の利用可能性をチェックし、ログ出力する処理を追加しました。
+
+**`requirements-macos.txt`**
+- **依存関係:** 動画機能の強化に伴い、`imageio-ffmpeg>=0.4.9` を追加しました。
+
+---
+<!-- END LOCAL CHANGES -->
+
 <p align="center">
     <a href="./LICENSE"><img src="https://img.shields.io/badge/License-LGPL%20v3-blue.svg"></a>
     <a href=""><img src="https://img.shields.io/github/v/release/CVHub520/X-AnyLabeling?color=ffa"></a>

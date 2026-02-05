@@ -21,7 +21,7 @@ class SearchPattern:
 
 
 def parse_search_pattern(search_text: str) -> SearchPattern:
-    """
+    r"""
     Parse search text into a SearchPattern object.
 
     Args:

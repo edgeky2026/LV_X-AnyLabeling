@@ -3,8 +3,10 @@ import json
 import os.path as osp
 from PIL import Image
 
+from datetime import datetime
+
 from PyQt5 import QtWidgets
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QThread
 from PyQt5.QtWidgets import (
     QVBoxLayout,
     QProgressDialog,
@@ -13,6 +15,8 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QDialogButtonBox,
     QApplication,
+    QButtonGroup,
+    QRadioButton,
 )
 
 from anylabeling.app_info import __version__
@@ -138,6 +142,91 @@ def get_image_size(image_path):
     with Image.open(image_path) as img:
         return img.size
 
+class VideoExportThread(QThread):
+    def __init__(self, image_list, output_dir):
+        super().__init__()
+        self.image_list = list(image_list)
+        self.output_dir = output_dir
+
+    def run(self):
+        try:
+            import cv2
+            import numpy as np
+
+            if self.image_list and len(self.image_list) > 0:
+                dir_path = osp.dirname(self.image_list[0])
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                video_output_path = osp.join(dir_path, f"labeled_video_{timestamp}.mp4")
+
+                # Read first image to get dimensions
+                first_img = cv2.imread(self.image_list[0])
+                if first_img is not None:
+                    height, width = first_img.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    video_writer = cv2.VideoWriter(video_output_path, fourcc, 30.0, (width, height))
+                    logger.info(f"Creating labeled video: {video_output_path}")
+
+                    for image_file in self.image_list:
+                        frame_img = cv2.imread(image_file)
+                        if frame_img is None:
+                            continue
+
+                        # Read corresponding JSON file
+                        label_file = osp.splitext(image_file)[0] + ".json"
+                        if self.output_dir:
+                            label_file = osp.join(self.output_dir, osp.basename(label_file))
+
+                        if osp.exists(label_file):
+                            try:
+                                with io_open(label_file, "r") as f:
+                                    data = json.load(f)
+
+                                shapes = data.get("shapes", [])
+
+                                # Batched points
+                                poly_points_list = []
+                                rect_points_list = []
+
+                                for shape_data in shapes:
+                                    shape_type = shape_data.get("shape_type", "polygon")
+                                    points = shape_data.get("points", [])
+
+                                    if len(points) < 3:
+                                        continue
+
+                                    pts = np.array([(int(p[0]), int(p[1])) for p in points], np.int32)
+                                    pts = pts.reshape((-1, 1, 2))
+
+                                    if shape_type == "rectangle":
+                                        rect_points_list.append(pts)
+                                    elif shape_type == "polygon":
+                                        poly_points_list.append(pts)
+
+                                # Batch draw rectangles
+                                if rect_points_list:
+                                    rect_overlay = frame_img.copy()
+                                    cv2.fillPoly(rect_overlay, rect_points_list, (180, 180, 255))  # Light red (BGR)
+                                    alpha_bbox = 0.2  # High transparency
+                                    cv2.addWeighted(rect_overlay, alpha_bbox, frame_img, 1 - alpha_bbox, 0, frame_img)
+                                    # Draw red outline
+                                    cv2.polylines(frame_img, rect_points_list, True, (0, 0, 255), 2)
+
+                                # Batch draw polygons
+                                if poly_points_list:
+                                    poly_overlay = frame_img.copy()
+                                    cv2.fillPoly(poly_overlay, poly_points_list, (0, 128, 0))  # Dark green (BGR)
+                                    alpha_mask = 0.7  # Low transparency
+                                    cv2.addWeighted(poly_overlay, alpha_mask, frame_img, 1 - alpha_mask, 0, frame_img)
+                            except Exception as e:
+                                logger.warning(f"Error reading label file {label_file}: {e}")
+
+                        video_writer.write(frame_img)
+
+                    video_writer.release()
+                    logger.info(f"Labeled video saved to: {video_output_path}")
+        except Exception as e:
+            logger.error(f"Failed to create labeled video: {e}")
+
 
 def load_existing_shapes(image_file):
     """
@@ -180,6 +269,11 @@ def load_existing_shapes(image_file):
 def finish_processing(self, progress_dialog):
     target_index = self.current_index
     target_file = self.image_list[self.current_index]
+    # --- Video Export with Burned-in Masks (Background) ---
+    self.video_export_thread = VideoExportThread(self.image_list, self.output_dir)
+    self.video_export_thread.start()
+    # --- End Video Export ---
+    
     self.import_image_folder(osp.dirname(target_file), load=False)
     self.file_list_widget.setCurrentRow(target_index)
 
@@ -406,7 +500,7 @@ def show_progress_dialog_and_process(self):
             batch_processing_mode = model.get_batch_processing_mode()
 
         def update_progress(value):
-            if batch_processing_mode != "video":
+            if batch_processing_mode != "video" or not self.run_tracker:
                 progress_dialog.setLabelText(f"{value}/{len(self.image_list)}")
 
         progress_bar.valueChanged.connect(update_progress)
@@ -473,6 +567,116 @@ def show_progress_dialog_and_process(self):
     QTimer.singleShot(200, lambda: process_next_image(self, progress_dialog))
 
 
+class BatchModeSelectionDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.mode = "tracking"
+        self.text_prompt = ""
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle(self.tr("Select Batch Processing Mode"))
+        self.setFixedSize(450, 300)
+        self.setWindowFlags(Qt.Dialog | Qt.MSWindowsFixedSizeDialogHint)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        # Mode Selection Group
+        self.mode_group = QButtonGroup(self)
+        
+        self.track_radio = QRadioButton(self.tr("Video Tracking (Propagation)"))
+        self.track_radio.setChecked(True)
+        self.track_radio.setToolTip(self.tr("Use existing mask to track objects across frames using video propagation."))
+        self.mode_group.addButton(self.track_radio)
+        layout.addWidget(self.track_radio)
+
+        track_desc = QLabel(self.tr("Propagate the current object mask to all frames."))
+        track_desc.setStyleSheet("color: #666; font-size: 11px; margin-left: 20px; margin-bottom: 10px;")
+        layout.addWidget(track_desc)
+
+        self.text_radio = QRadioButton(self.tr("Text Prompt (All Frames)"))
+        self.text_radio.setToolTip(self.tr("Apply text prompt to each frame independently."))
+        self.mode_group.addButton(self.text_radio)
+        layout.addWidget(self.text_radio)
+
+        text_desc = QLabel(self.tr("Run text prompt inference on every frame."))
+        text_desc.setStyleSheet("color: #666; font-size: 11px; margin-left: 20px;")
+        layout.addWidget(text_desc)
+
+        # Text Input Area
+        self.input_container = QtWidgets.QWidget()
+        input_layout = QVBoxLayout(self.input_container)
+        input_layout.setContentsMargins(20, 0, 0, 0)
+        
+        self.text_input = QLineEdit()
+        self.text_input.setPlaceholderText(self.tr("Enter text prompt (e.g., 'black cat')..."))
+        self.text_input.setEnabled(False)
+        input_layout.addWidget(self.text_input)
+        
+        layout.addWidget(self.input_container)
+
+        # Connect signals
+        self.track_radio.toggled.connect(self.on_mode_changed)
+        self.text_radio.toggled.connect(self.on_mode_changed)
+
+        # Buttons
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(self.validate_and_accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        self.setLayout(layout)
+        self.setLayout(layout)
+        self.setStyleSheet(
+            """
+            QRadioButton { font-size: 13px; font-weight: 500; color: #1d1d1f; }
+            QLineEdit {
+                border: 1px solid #E5E5E5;
+                border-radius: 8px;
+                background-color: #F9F9F9;
+                font-size: 13px;
+                height: 36px;
+                padding: 0 12px;
+                color: #1d1d1f;
+            }
+            QLineEdit:disabled { background-color: #F0F0F0; color: #999; }
+            QLineEdit:focus { border: 2px solid #0066FF; }
+            QLabel { color: #1d1d1f; }
+        """
+        )
+
+    def on_mode_changed(self):
+        is_text_mode = self.text_radio.isChecked()
+        self.text_input.setEnabled(is_text_mode)
+        if is_text_mode:
+            self.text_input.setFocus()
+            self.mode = "text"
+        else:
+            self.mode = "tracking"
+
+    def validate_and_accept(self):
+        if self.text_radio.isChecked():
+            text = self.text_input.text().strip()
+            if not text:
+                QtWidgets.QMessageBox.warning(
+                    self, 
+                    self.tr("Missing Input"), 
+                    self.tr("Please enter a text prompt.")
+                )
+                return
+            self.text_prompt = text
+        self.accept()
+
+    def get_selection(self):
+        if self.exec_() == QDialog.Accepted:
+            return self.mode, self.text_prompt
+        return None, None
+
+
 def run_all_images(self):
     if len(self.image_list) < 1:
         return
@@ -499,16 +703,33 @@ def run_all_images(self):
         )
         return
 
-    response = QtWidgets.QMessageBox()
-    response.setIcon(QtWidgets.QMessageBox.Warning)
-    response.setWindowTitle(self.tr("Confirmation"))
-    response.setText(self.tr("Do you want to process all images?"))
-    response.setStandardButtons(
-        QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Ok
-    )
-    response.setStyleSheet(get_msg_box_style())
-    if response.exec_() != QtWidgets.QMessageBox.Ok:
-        return
+    # Skip confirmation for Video mode because we have a dedicated dialog
+    model_type = self.auto_labeling_widget.model_manager.loaded_model_config["type"]
+    batch_processing_mode = "default"
+    if model_type == "remote_server":
+        model = self.auto_labeling_widget.model_manager.loaded_model_config["model"]
+        if hasattr(model, "get_batch_processing_mode"):
+            batch_processing_mode = model.get_batch_processing_mode()
+        
+        if batch_processing_mode is None:
+            self.auto_labeling_widget.model_manager.new_model_status.emit(
+                self.tr(
+                    "Batch processing is not supported for the current task."
+                )
+            )
+            return
+
+    if batch_processing_mode != "video":
+        response = QtWidgets.QMessageBox()
+        response.setIcon(QtWidgets.QMessageBox.Warning)
+        response.setWindowTitle(self.tr("Confirmation"))
+        response.setText(self.tr("Do you want to process all images?"))
+        response.setStandardButtons(
+            QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Ok
+        )
+        response.setStyleSheet(get_msg_box_style())
+        if response.exec_() != QtWidgets.QMessageBox.Ok:
+            return
 
     logger.info("Start running all images...")
 
@@ -517,29 +738,20 @@ def run_all_images(self):
     self.text_prompt = ""
     self.run_tracker = False
 
-    model_type = self.auto_labeling_widget.model_manager.loaded_model_config[
-        "type"
-    ]
-
     if model_type == "remote_server":
-        batch_processing_mode = "default"
-        model = self.auto_labeling_widget.model_manager.loaded_model_config[
-            "model"
-        ]
-        if hasattr(model, "get_batch_processing_mode"):
-            batch_processing_mode = model.get_batch_processing_mode()
-        else:
-            batch_processing_mode = "default"
-        if batch_processing_mode is None:
-            self.auto_labeling_widget.model_manager.new_model_status.emit(
-                self.tr(
-                    "Batch processing is not supported for the current task."
-                )
-            )
-            return
         if batch_processing_mode == "video":
-            self.run_tracker = True
-            show_progress_dialog_and_process(self)
+            dialog = BatchModeSelectionDialog(parent=self)
+            mode, text = dialog.get_selection()
+            
+            if mode == "tracking":
+                self.run_tracker = True
+                show_progress_dialog_and_process(self)
+            elif mode == "text":
+                self.text_prompt = text
+                # run_tracker must be False to allow looping in process_next_image
+                self.run_tracker = False 
+                show_progress_dialog_and_process(self)
+        
         elif batch_processing_mode == "text_prompt":
             text_input_dialog = TextInputDialog(parent=self)
             self.text_prompt = text_input_dialog.get_input_text()
@@ -547,21 +759,25 @@ def run_all_images(self):
                 show_progress_dialog_and_process(self)
         else:
             show_progress_dialog_and_process(self)
+
     elif model_type in _BATCH_PROCESSING_TEXT_PROMPT_MODELS:
         text_input_dialog = TextInputDialog(parent=self)
         self.text_prompt = text_input_dialog.get_input_text()
         if self.text_prompt or model_type == "yoloe":
             show_progress_dialog_and_process(self)
+            
     elif (
         self.auto_labeling_widget.model_manager.loaded_model_config["type"]
         == "florence2"
     ):
         self.text_prompt = self.auto_labeling_widget.edit_text.text()
         show_progress_dialog_and_process(self)
+        
     elif (
         self.auto_labeling_widget.model_manager.loaded_model_config["type"]
         in _BATCH_PROCESSING_VIDEO_MODELS
     ):
+        # Fallback for local video models if any
         self.run_tracker = True
         show_progress_dialog_and_process(self)
     else:

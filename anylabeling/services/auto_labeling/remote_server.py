@@ -332,25 +332,6 @@ class RemoteServer(Model):
                 self._reset_video_session()
 
             if not self.video_session_id:
-                frames_data = []
-                for frame_path in image_list:
-                    if os.path.exists(frame_path):
-                        with open(frame_path, "rb") as f:
-                            frame_base64 = base64.b64encode(f.read()).decode(
-                                "utf-8"
-                            )
-                        ext = os.path.splitext(frame_path)[1].lower()
-                        mime_type = {
-                            ".jpg": "image/jpeg",
-                            ".jpeg": "image/jpeg",
-                            ".png": "image/png",
-                            ".bmp": "image/bmp",
-                            ".webp": "image/webp",
-                        }.get(ext, "image/jpeg")
-                        frames_data.append(
-                            f"data:{mime_type};base64,{frame_base64}"
-                        )
-
                 message = self.tr(
                     "Packing completed, initializing video session... "
                     "(This may take some time, please wait patiently)"
@@ -358,27 +339,62 @@ class RemoteServer(Model):
                 logger.info(message)
                 self.on_message(message)
 
-                init_url = f"{self.server_url}/v1/video/init"
-                init_response = requests.post(
-                    url=init_url,
-                    json={
+                init_url = f"{self.server_url}/v1/video/init_multipart"
+
+                files = []
+                opened_files = []
+                try:
+                    for i, frame_path in enumerate(image_list):
+                        if os.path.exists(frame_path):
+                            f = open(frame_path, "rb")
+                            opened_files.append(f)
+                            
+                            ext = os.path.splitext(frame_path)[1].lower()
+                            mime_type = {
+                                ".jpg": "image/jpeg",
+                                ".jpeg": "image/jpeg",
+                                ".png": "image/png",
+                                ".bmp": "image/bmp",
+                                ".webp": "image/webp",
+                            }.get(ext, "image/jpeg")
+
+                            files.append(
+                                (
+                                    "frames",
+                                    (
+                                        os.path.basename(frame_path),
+                                        f,
+                                        mime_type,
+                                    ),
+                                )
+                            )
+
+                    data = {
                         "model": self.current_model_id,
-                        "frames": frames_data,
                         "start_frame_index": 0,
-                    },
-                    headers=self.headers,
-                    timeout=self.timeout * 2,
-                )
-                init_response.raise_for_status()
-                init_result = init_response.json()
-                self.video_session_id = init_result.get("data", {}).get(
-                    "session_id"
-                )
-                self.video_initialized = True
-                self.video_session_image_list = image_list.copy()
-                logger.info(
-                    f"Video session initialized: {self.video_session_id}"
-                )
+                    }
+
+                    init_response = requests.post(
+                        url=init_url,
+                        data=data,
+                        files=files,
+                        headers={"Token": self.headers.get("Token", "")},
+                        timeout=self.timeout * 2,
+                    )
+                    init_response.raise_for_status()
+                    init_result = init_response.json()
+                    self.video_session_id = init_result.get("data", {}).get(
+                        "session_id"
+                    )
+                    self.video_initialized = True
+                    self.video_session_image_list = image_list.copy()
+                    logger.info(
+                        f"Video session initialized: {self.video_session_id}"
+                    )
+
+                finally:
+                    for f in opened_files:
+                        f.close()
 
             prompt_url = f"{self.server_url}/v1/video/prompt"
             prompt_response = requests.post(
@@ -721,7 +737,7 @@ class RemoteServer(Model):
                             logger.warning(f"Error updating progress: {e}")
 
                 elif event_type == "completed":
-                    results = event.get("results", {})
+                    results = event.get("results") or {}
                     logger.info(
                         f"Propagation completed: {len(results)} frame results"
                     )
